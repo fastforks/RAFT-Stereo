@@ -88,6 +88,16 @@ class RAFTStereo(nn.Module):
                 m.half()
         return self
 
+    def use_cudnn_half_acc_convs(self):
+        """fp16 model only: run all convolutions with fp16 accumulation via cuDNN (core/cudnn_conv.py).
+        Not bit-identical to fp32 accumulation; ETH3D/Middlebury accuracy matches AMP."""
+        from core.cudnn_conv import patch_convs, patch_norms
+
+        patch_norms(
+            self
+        )  # keep NHWC through the encoders' norms (else every following conv input is copied)
+        return patch_convs(self)
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
