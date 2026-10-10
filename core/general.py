@@ -37,6 +37,22 @@ CX = (256, 256, 128)  # x-part channels of the GRU inputs at 1/4, 1/8, 1/16
 IN_CHUNK = 1024
 VERIFY = os.environ.get("RAFT_VERIFY") == "1"   # check every new conv plan against an fp32 reference (debug)
 FUSED = os.environ.get("RAFT_FUSED", "0") == "1"  # GRU convs with fused epilogues (core/cutlass_conv.cu, compiled once)
+# encoders via fastbb.normconv (exp 006 fastbb; fastbb-encoder workstream, 2026-10-10): cnet < 128-channel convs as one
+# CUTLASS kernel with the BN + ReLU / ResidualBlock-tail epilogue (before: cuDNN + affine pass); fnet (instance norm): the
+# instance-norm statistics computed in the conv epilogue (no stats pass) and, for the 64-channel stride-1 convs, the
+# normalize + ReLU of the previous conv applied in the conv mainloop (no apply pass). FASTBB_ENC=0: previous path.
+FASTBB_ENC = os.environ.get("FASTBB_ENC", "1") == "1"
+
+
+def _normconv():
+    try:
+        from fastbb import normconv
+    except ImportError:
+        import sys
+        sys.path.insert(0, "/home/florian/projects/experiments/006-fast-backbones")
+        from fastbb import normconv
+    normconv.load()
+    return normconv
 
 
 def fused_cfg_zr(P):
@@ -73,6 +89,15 @@ class S:
     @property
     def p(self):
         return self.h * self.w
+
+
+def _full(x):
+    return x.c0 == 0 and x.c == x.ctot
+
+
+def _t4(x):
+    """S (whole buffer) -> channels-last [1, C, H, W] view."""
+    return x.buf.permute(2, 0, 1)[None]
 
 
 class Convs:
@@ -288,6 +313,15 @@ class GeneralRAFT:
         self._unfusable = set(
             os.environ.get("RAFT_FUSED_SKIP", "").split(",")
         )  # debug: conv names kept plain
+        self.nc = None
+        if FASTBB_ENC:
+            self.nc = _normconv()
+            # KRSC weights viewed as channels-last [K, C, R, S] (no copy)
+            self.W4 = {
+                n: w.permute(0, 3, 1, 2)
+                for n, w in self.W.w.items()
+                if n.startswith(("fnet.layer", "cnet."))
+            }
 
     # ---- small helpers
     def _new(self, h, w, c):
@@ -345,6 +379,30 @@ class GeneralRAFT:
         K, R, _, C = w.shape
         ho, wo = (x.h - 1) // stride + 1, (x.w - 1) // stride + 1
         cfg = None if self.fused is None else fused_cfg_affine(ho * wo, K)
+        if (
+            cfg is None
+            and self.nc is not None
+            and name in self.W4
+            and _full(x)
+            and C % 8 == 0
+            and K % 8 == 0
+            and out is None
+            and out2 is None
+            and flow is None
+            and mode in (0, 1, 3)
+            and (r is None or _full(r))
+        ):
+            y4 = self.nc.conv(
+                _t4(x),
+                self.W4[name],
+                self.W.s.get(name),
+                self.W.t.get(name),
+                res=None if r is None else _t4(r),
+                act=int(mode in (1, 3)),
+                res_mode=int(mode == 3),
+                stride=stride,
+            )[0]
+            return S(y4.permute(0, 2, 3, 1)[0])
         if (
             cfg is not None
             and x.c0 == 0
@@ -423,6 +481,23 @@ class GeneralRAFT:
         )
 
     # ---- encoders
+    def res_block_nc(self, x: S, name, stride, ds):
+        """instance-norm ResidualBlock with fastbb.normconv: stats from the conv epilogues; the conv1 output is normalized
+        (+ ReLU) inside conv2's mainloop when conv2 is 64-channel (cheaper than a pass there; a pass for 96 / 128)."""
+        nc, W4 = self.nc, self.W4
+        x4 = _t4(x)
+        d4 = sd = None
+        if ds:
+            d4, sd = nc.conv_in(x4, W4[name + ".ds"], stride=stride)
+        c1, s1 = nc.conv_in(x4, W4[name + ".c1"], stride=stride)
+        if FASTBB_ENC_PRE and W4[name + ".c2"].shape[0] <= 64:
+            c2, s2 = nc.conv_in(c1, W4[name + ".c2"], pre=s1)
+        else:
+            c2, s2 = nc.conv_in(nc.in_apply(c1, s1, mode=0, inplace=True), W4[name + ".c2"])
+        del c1
+        o = nc.in_apply(c2, s2, mode=2, r=d4, rst=sd, inplace=True) if ds else nc.in_apply(c2, s2, mode=1, r=x4, inplace=True)
+        return S(o.permute(0, 2, 3, 1)[0])
+
     def res_block(self, x: S, name, stride, ds, batch):
         if batch:
             r = self.conv_act(x, name + ".ds", 0, stride) if ds else x
