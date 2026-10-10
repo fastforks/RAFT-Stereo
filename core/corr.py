@@ -201,12 +201,15 @@ class CorrBlockGather1D:
         B, D, H, W1 = fmap1.shape
         # [B, H, W1, D] @ [B, H, D, W2] -> [B, H, W1, W2]
         corr = torch.matmul(fmap1.permute(0, 2, 3, 1), fmap2.permute(0, 2, 1, 3)) * (D**-0.5)
-        corr = corr.reshape(B * H * W1, 1, -1)
+        corr = corr.reshape(B * H * W1, -1)
         self.shape = (B, H, W1)
-        self.corr_pyramid = [corr[:, 0]]
+        self.corr_pyramid = [corr]
         for _ in range(1, num_levels):
-            corr = F.avg_pool1d(corr, 2, stride=2)
-            self.corr_pyramid.append(corr[:, 0])
+            # == F.avg_pool1d(corr, 2, 2) as the mean of even / odd slices (TensorRT 11's Myelin finds no tactic for
+            # a 1-D average pool over B*H*W rows)
+            n = corr.shape[-1] // 2
+            corr = corr[:, : 2 * n].reshape(corr.shape[0], n, 2).mean(dim=-1)
+            self.corr_pyramid.append(corr)
         self.taps = torch.arange(-radius, radius + 2, device=fmap1.device)
 
     def __call__(self, coords):
