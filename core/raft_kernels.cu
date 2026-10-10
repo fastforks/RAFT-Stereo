@@ -186,8 +186,8 @@ extern "C" __global__ void corr_lookup(const __half* __restrict__ v0, const __ha
 
 // ---------------------------------------------------------------------------------------------------------------
 // avg_pool2d(kernel 3, stride 2, padding 1, count_include_pad) of a C-channel slice into another slice.
-extern "C" __global__ void pool2x_into(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
-                                       int dstride, int Hd, int Wd, int C) {
+__device__ __forceinline__ void pool2x_body(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
+                                            int dstride, __half* dst2, int Hd, int Wd, int C) {
     const int CV = C / 8;  // 8 channels per thread
     GRID_STRIDE(i, (long long)Hd * Wd * CV) {
         int c = (int)(i % CV) * 8;
@@ -212,12 +212,22 @@ extern "C" __global__ void pool2x_into(const __half* __restrict__ src, int sstri
 #pragma unroll
         for (int k = 0; k < 8; ++k) o[k] = __float2half(s[k] / 9.f);
         *reinterpret_cast<uint4*>(dst + pd * dstride + c) = *reinterpret_cast<const uint4*>(o);
+        if (dst2) *reinterpret_cast<uint4*>(dst2 + pd * dstride + c) = *reinterpret_cast<const uint4*>(o);
     }
+}
+extern "C" __global__ void pool2x_into(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
+                                       int dstride, int Hd, int Wd, int C) {
+    pool2x_body(src, sstride, Hs, Ws, dst, dstride, nullptr, Hd, Wd, C);
+}
+// general path: the result goes to two slices with the same pixel stride (the [h | x] and [r*h | x] buffers)
+extern "C" __global__ void pool2x_dual(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
+                                       __half* dst2, int dstride, int Hd, int Wd, int C) {
+    pool2x_body(src, sstride, Hs, Ws, dst, dstride, dst2, Hd, Wd, C);
 }
 
 // Bilinear upsampling with align_corners=True (PyTorch formula) of a C-channel slice into another slice.
-extern "C" __global__ void interp_into(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
-                                       int dstride, int Hd, int Wd, int C) {
+__device__ __forceinline__ void interp_body(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
+                                            int dstride, __half* dst2, int Hd, int Wd, int C) {
     float rh = Hd > 1 ? (float)(Hs - 1) / (float)(Hd - 1) : 0.f;
     float rw = Wd > 1 ? (float)(Ws - 1) / (float)(Wd - 1) : 0.f;
     const int CV = C / 8;  // 8 channels per thread
@@ -242,7 +252,16 @@ extern "C" __global__ void interp_into(const __half* __restrict__ src, int sstri
             o[k] = __float2half(h0l * (w0l * __half2float(v00[k]) + w1l * __half2float(v01[k])) +
                                 h1l * (w0l * __half2float(v10[k]) + w1l * __half2float(v11[k])));
         *reinterpret_cast<uint4*>(dst + pd * dstride + c) = *reinterpret_cast<const uint4*>(o);
+        if (dst2) *reinterpret_cast<uint4*>(dst2 + pd * dstride + c) = *reinterpret_cast<const uint4*>(o);
     }
+}
+extern "C" __global__ void interp_into(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
+                                       int dstride, int Hd, int Wd, int C) {
+    interp_body(src, sstride, Hs, Ws, dst, dstride, nullptr, Hd, Wd, C);
+}
+extern "C" __global__ void interp_dual(const __half* __restrict__ src, int sstride, int Hs, int Ws, __half* dst,
+                                       __half* dst2, int dstride, int Hd, int Wd, int C) {
+    interp_body(src, sstride, Hs, Ws, dst, dstride, dst2, Hd, Wd, C);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -502,4 +521,90 @@ extern "C" __global__ void __launch_bounds__(256) corr_gemm(const __half* __rest
             }
             __syncwarp();
         }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// General (size-independent) path, core/general.py: plain precompiled cuDNN convs + these elementwise epilogues.
+// Per-channel affine + activation of an NHWC slice y (C % 8 == 0, 16-byte aligned), written to slice o and
+// optionally also to slice o2 (o may equal y: in place):
+//   v = y * s[c] + t[c]   (s == nullptr: scale 1; t == nullptr: shift 0), fp32 math, rounded to fp16
+//   mode 0: v      1: relu(v)      2: tanh(v)      3: relu(fp16(relu(v)) + r)   (residual r: a slice, fp16 add)
+extern "C" __global__ void affine_act(const __half* y, int ystride, __half* o, int ostride, __half* o2, int o2stride,
+                                      const float* __restrict__ s, const float* __restrict__ t,
+                                      const __half* __restrict__ r, int rstride, long long P, int C, int mode) {
+    const int CV = C / 8;
+    GRID_STRIDE(i, P * CV) {
+        long long p = i / CV;
+        int c0 = (int)(i % CV) * 8;
+        uint4 yv = *reinterpret_cast<const uint4*>(y + p * ystride + c0);
+        const __half* yh = reinterpret_cast<const __half*>(&yv);
+        uint4 rv = make_uint4(0, 0, 0, 0);
+        if (mode == 3) rv = *reinterpret_cast<const uint4*>(r + p * rstride + c0);
+        const __half* rh = reinterpret_cast<const __half*>(&rv);
+        __align__(16) __half out[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            int c = c0 + k;
+            float v = __half2float(yh[k]);
+            if (s) v *= s[c];
+            if (t) v += t[c];
+            if (mode == 1) v = fmaxf(v, 0.f);
+            else if (mode == 2) v = tanhf(v);
+            __half hv = __float2half(mode == 3 ? fmaxf(v, 0.f) : v);
+            if (mode == 3) hv = hrelu(__hadd(hv, rh[k]));
+            out[k] = hv;
+        }
+        *reinterpret_cast<uint4*>(o + p * ostride + c0) = *reinterpret_cast<const uint4*>(out);
+        if (o2) *reinterpret_cast<uint4*>(o2 + p * o2stride + c0) = *reinterpret_cast<const uint4*>(out);
+    }
+}
+
+// GRU gates after the z|r conv (zr: [P][256] raw conv output, czr: [P][256] context terms incl. biases):
+// z = sigmoid(zr[:128] + cz) written back into zr[:128]; rh = sigmoid(zr[128:] + cr) * h written into the rh slice
+// (h and rh slices have the same pixel stride).
+extern "C" __global__ void gru_zr(__half* zr, const __half* __restrict__ czr, const __half* __restrict__ h,
+                                  __half* __restrict__ rh, int stride, long long P) {
+    GRID_STRIDE(i, P * 16) {  // 8 channels per thread
+        long long p = i / 16;
+        int c = (int)(i % 16) * 8;
+        uint4 zv = *reinterpret_cast<const uint4*>(zr + p * 256 + c), rv = *reinterpret_cast<const uint4*>(zr + p * 256 + 128 + c);
+        uint4 czv = *reinterpret_cast<const uint4*>(czr + p * 256 + c), crv = *reinterpret_cast<const uint4*>(czr + p * 256 + 128 + c);
+        uint4 hv = *reinterpret_cast<const uint4*>(h + p * stride + c);
+        const __half *zh = reinterpret_cast<const __half*>(&zv), *rr = reinterpret_cast<const __half*>(&rv);
+        const __half *cz = reinterpret_cast<const __half*>(&czv), *cr = reinterpret_cast<const __half*>(&crv);
+        const __half* hh = reinterpret_cast<const __half*>(&hv);
+        __align__(16) __half oz[8], orh[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float z = 1.f / (1.f + __expf(-(__half2float(zh[k]) + __half2float(cz[k]))));
+            float r = 1.f / (1.f + __expf(-(__half2float(rr[k]) + __half2float(cr[k]))));
+            oz[k] = __float2half(z);
+            orh[k] = __hmul(__float2half(r), hh[k]);
+        }
+        *reinterpret_cast<uint4*>(zr + p * 256 + c) = *reinterpret_cast<const uint4*>(oz);
+        *reinterpret_cast<uint4*>(rh + p * stride + c) = *reinterpret_cast<const uint4*>(orh);
+    }
+}
+
+// GRU state update after the q conv (q: [P][128] raw conv output, cq: [P][128] context term incl. bias, z at zr[:128]):
+// h = (1 - z) h + z tanh(q + cq), in place in the h slice; optionally also written to a packed copy h2 ([P][128]).
+extern "C" __global__ void gru_update(const __half* __restrict__ q, const __half* __restrict__ cq, const __half* __restrict__ zr,
+                                      __half* h, int stride, __half* h2, long long P) {
+    GRID_STRIDE(i, P * 16) {
+        long long p = i / 16;
+        int c = (int)(i % 16) * 8;
+        uint4 qv = *reinterpret_cast<const uint4*>(q + p * 128 + c), cv = *reinterpret_cast<const uint4*>(cq + p * 128 + c);
+        uint4 zv = *reinterpret_cast<const uint4*>(zr + p * 256 + c), hv = *reinterpret_cast<const uint4*>(h + p * stride + c);
+        const __half *qh = reinterpret_cast<const __half*>(&qv), *ch = reinterpret_cast<const __half*>(&cv);
+        const __half *zh = reinterpret_cast<const __half*>(&zv), *hh = reinterpret_cast<const __half*>(&hv);
+        __align__(16) __half o[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float qq = tanhf(__half2float(qh[k]) + __half2float(ch[k]));
+            float hf = __half2float(hh[k]), z = __half2float(zh[k]);
+            o[k] = __float2half(hf + z * (qq - hf));
+        }
+        *reinterpret_cast<uint4*>(h + p * stride + c) = *reinterpret_cast<const uint4*>(o);
+        if (h2) *reinterpret_cast<uint4*>(h2 + p * 128 + c) = *reinterpret_cast<const uint4*>(o);
+    }
 }
