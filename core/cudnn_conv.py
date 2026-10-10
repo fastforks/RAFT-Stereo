@@ -9,6 +9,7 @@ fastest. Registered as a torch custom op so torch.compile treats it as an opaque
     model.use_cudnn_half_acc_convs()   # see RAFTStereo
 """
 
+import os
 import re
 import statistics
 from typing import List, Optional
@@ -77,7 +78,8 @@ def _build(x, w, b, padding, stride):
     H16 = cudnn.data_type.HALF
     N, K = x.shape[0], w.shape[0]
     Ho, Wo = _out_hw(x, w, padding, stride)
-    torch_ms = _time(lambda: F.conv2d(x, w, b, stride, padding))
+    heuristic = os.environ.get("RAFT_TUNE") == "heuristic"  # first verified cuDNN plan, no timing
+    torch_ms = float("inf") if heuristic else _time(lambda: F.conv2d(x, w, b, stride, padding))
     try:
         h = _get_handle()
         g = cudnn.pygraph(
@@ -103,7 +105,11 @@ def _build(x, w, b, padding, stride):
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        g.check_support(); g.build_plans(cudnn.build_plan_policy.ALL)
+        g.check_support()
+        if (
+            os.environ.get("RAFT_TUNE") != "heuristic"
+        ):  # heuristic mode builds plans lazily (runtime-compiled ones cost ~0.3 s each)
+            g.build_plans(cudnn.build_plan_policy.ALL)
     except Exception:  # noqa: BLE001 - no cuDNN half plan for this shape (e.g. 2 or 3 input channels)
         return ("torch",)
     y = torch.empty(
@@ -122,6 +128,8 @@ def _build(x, w, b, padding, stride):
         if _engine(g, i) in DENY_ENGINES:
             continue
         try:
+            if heuristic:
+                g.build_plan_at_index(i)
             ws = torch.empty(
                 max(g.get_workspace_size_plan_at_index(i), 1), device=x.device, dtype=torch.uint8
             )
@@ -137,11 +145,13 @@ def _build(x, w, b, padding, stride):
                 )
                 continue
             pack = {X: x, W: w, Y: y} if B is None else {X: x, W: w, B: b, Y: y}
-            ms = _time(lambda: g.execute_plan_at_index(pack, ws, i, handle=h))
+            ms = 0.0 if heuristic else _time(lambda: g.execute_plan_at_index(pack, ws, i, handle=h))  # noqa: B023 - _time invokes this callback synchronously
         except Exception:  # noqa: BLE001
             continue
         if best is None or ms < best[0]:
             best = (ms, i, g.get_workspace_size_plan_at_index(i))
+        if heuristic:
+            break
     if best is None or best[0] >= torch_ms:
         return ("torch",)
     return ("cudnn", g, X, W, B, Y, best[1], best[2])

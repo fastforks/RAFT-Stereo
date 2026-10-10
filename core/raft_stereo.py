@@ -98,6 +98,37 @@ class RAFTStereo(nn.Module):
         )  # keep NHWC through the encoders' norms (else every following conv input is copied)
         return patch_convs(self)
 
+    def use_fast_loop(self):
+        """fp16 model, inference (test_mode, batch 1): run the update loop like the Rust engine (core/fast_loop.py):
+        wide GRU buffers written in slices, fused cuDNN epilogues, custom kernels, one CUDA graph per 2 iterations."""
+        if not self._fast_loop_compatible():
+            raise ValueError(
+                "fast loop requires eval fp16 CUDA weights on the current device, three 128-channel "
+                "GRUs, downsample=2, corr_levels=4, corr_radius=4, slow_fast_gru=False "
+                "and shared_backbone=False"
+            )
+        from core.fast_loop import FastLoop
+
+        self.fast_loop = FastLoop(self)
+        return self
+
+    def _fast_loop_compatible(self):
+        a = self.args
+        return (
+            not self.training
+            and list(a.hidden_dims) == [128, 128, 128]
+            and a.n_gru_layers == 3
+            and a.n_downsample == 2
+            and a.corr_levels == 4
+            and a.corr_radius == 4
+            and not a.slow_fast_gru
+            and not a.shared_backbone
+            and all(
+                p.is_cuda and p.dtype == torch.float16 and p.device.index == torch.cuda.current_device()
+                for p in self.parameters()
+            )
+        )
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -156,6 +187,10 @@ class RAFTStereo(nn.Module):
                     fmap1, fmap2 = self.fnet([image1, image2])
             net_list = [torch.tanh(x[0]) for x in cnet_list]
             inp_list = [torch.relu(x[1]) for x in cnet_list]
+            if getattr(self, 'fast_loop', None) is not None and test_mode and image1.shape[0] == 1 and flow_init is None \
+                    and not torch.is_grad_enabled() and self._fast_loop_compatible():
+                zqr_list = [conv(i) for i, conv in zip(inp_list, self.context_zqr_convs)]
+                return self.fast_loop(self, net_list, zqr_list, fmap1, fmap2, iters, image1.shape[2], image1.shape[3])
 
             # Rather than running the GRU's conv layers on the context features multiple times, we do it once at the beginning 
             inp_list = [list(conv(i).split(split_size=conv.out_channels//3, dim=1)) for i,conv in zip(inp_list, self.context_zqr_convs)]
