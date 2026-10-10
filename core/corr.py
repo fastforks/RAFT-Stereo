@@ -44,7 +44,7 @@ class CorrBlockFast1D:
     def __call__(self, coords):
         out_pyramid = []
         bz, _, ht, wd = coords.shape
-        coords = coords[:, [0]]
+        coords = coords[:, :1]  # list indexing ([0]) builds a CPU index tensor -> H2D copy + sync
         for i in range(self.num_levels):
             corr = CorrSampler.apply(self.corr_pyramid[i].squeeze(3), coords/2**i, self.radius)
             out_pyramid.append(corr.view(bz, -1, ht, wd))
