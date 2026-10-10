@@ -76,7 +76,10 @@ class RAFTStereo(nn.Module):
         mask = mask.reshape(N, 1, 9, factor, factor, H, W)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(factor * flow, [3,3], padding=1)
+        # 3x3 neighbourhoods as 9 shifted slices of the zero-padded flow (= F.unfold(.., [3,3], padding=1), same
+        # order; unfold/Im2Col has no ONNX / TensorRT counterpart)
+        fp = F.pad(factor * flow, [1, 1, 1, 1])
+        up_flow = torch.stack([fp[:, :, i:i + H, j:j + W] for i in range(3) for j in range(3)], dim=2)
         up_flow = up_flow.view(N, D, 9, 1, 1, H, W)
 
         up_flow = torch.sum(mask * up_flow, dim=2)
