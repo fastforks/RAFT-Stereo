@@ -36,6 +36,23 @@ except ImportError as e:  # pragma: no cover
 CX = (256, 256, 128)  # x-part channels of the GRU inputs at 1/4, 1/8, 1/16
 IN_CHUNK = 1024
 VERIFY = os.environ.get("RAFT_VERIFY") == "1"   # check every new conv plan against an fp32 reference (debug)
+FUSED = os.environ.get("RAFT_FUSED", "0") == "1"  # GRU convs with fused epilogues (core/cutlass_conv.cu, compiled once)
+
+
+def fused_cfg_zr(P):
+    """Fixed size rule (measured once on the RTX 5060 Ti, results/2026-10-09_v8_fused_gru.txt): CUTLASS tile config of
+    the fused z|r conv, or None = plain cuDNN conv + gru_zr kernel (faster for 4000 <= P < 10000 pixels)."""
+    return None if 4000 <= P < 10000 else 0
+
+
+def fused_cfg_q(P):
+    return 0 if P >= 10000 else 1
+
+
+def fused_cfg_affine(P, K):
+    """conv + bias/BN + activation: fused only for K >= 128 output channels; with 64/96 channels cuDNN's plain conv +
+    the separate affine_act pass is as fast or faster (results/2026-10-09_v8_fused_gru.txt)."""
+    return None if K < 128 else (0 if P >= 10000 else 1)
 
 
 # ------------------------------------------------------------------------------------------------ convolutions
@@ -263,6 +280,14 @@ class GeneralRAFT:
         self.convs = Convs()
         self.concurrent = os.environ.get("RAFT_CONCURRENT", "1") == "1"
         self.side = torch.cuda.Stream()
+        self.fused = None
+        if FUSED:
+            from core.cutlass_conv import EpiArgs, FusedConvs
+
+            self.fused, self._epi = FusedConvs.get(), EpiArgs
+        self._unfusable = set(
+            os.environ.get("RAFT_FUSED_SKIP", "").split(",")
+        )  # debug: conv names kept plain
 
     # ---- small helpers
     def _new(self, h, w, c):
@@ -276,15 +301,83 @@ class GeneralRAFT:
         self.convs(x, w, out, stride)
         return out
 
-    def affine(self, y: S, name, mode, r: S = None, out: S = None, out2: S = None):
+    def affine(self, y: S, name, mode, r: S = None, out: S = None, out2: S = None, flow=None):
         """Per-channel affine (BN scale/shift or bias) + activation of conv output y, in place or into out (+ out2)."""
         s, t = self.W.s.get(name), self.W.t.get(name)
         o = y if out is None else out
         k = self.k
-        k.launch("affine_act", k.linear(y.p * y.c // 8), y.ptr, y.ctot, o.ptr, o.ctot,
-                 0 if out2 is None else out2.ptr, 0 if out2 is None else out2.ctot, 0 if s is None else s, 0 if t is None else t,
-                 0 if r is None else r.ptr, 0 if r is None else r.ctot, y.p, y.c, mode)
+        k.launch(
+            "affine_act",
+            k.linear(y.p * y.c // 8),
+            y.ptr,
+            y.ctot,
+            o.ptr,
+            o.ctot,
+            0 if out2 is None else out2.ptr,
+            0 if out2 is None else out2.ctot,
+            0 if s is None else s,
+            0 if t is None else t,
+            0 if r is None else r.ptr,
+            0 if r is None else r.ctot,
+            y.p,
+            y.c,
+            mode,
+            0 if flow is None else flow[0],
+            0 if flow is None else flow[1],
+        )
         return o
+
+    def conv_act(
+        self,
+        x: S,
+        name,
+        mode,
+        stride=1,
+        out: S = None,
+        out2: S = None,
+        r: S = None,
+        flow=None,
+        tmp: S = None,
+    ):
+        """affine(conv(x)) -- as one fused-epilogue conv (RAFT_FUSED=1) when the operands allow it, else conv into
+        tmp (or a new buffer when out is None) followed by the affine_act kernel."""
+        w = self.W.w[name]
+        K, R, _, C = w.shape
+        ho, wo = (x.h - 1) // stride + 1, (x.w - 1) // stride + 1
+        cfg = None if self.fused is None else fused_cfg_affine(ho * wo, K)
+        if (
+            cfg is not None
+            and x.c0 == 0
+            and x.c == x.ctot
+            and C % 8 == 0
+            and name not in self._unfusable
+        ):
+            o = S(self._new(ho, wo, K)) if out is None else out
+            s, t = self.W.s.get(name), self.W.t.get(name)
+            e = self._epi(
+                2,
+                mode,
+                0 if r is None else r.ptr,
+                0 if r is None else r.ctot,
+                o.ptr,
+                o.ctot,
+                None,
+                0 if out2 is None else out2.ctot,
+                None if out2 is None else out2.ptr,
+                None,
+                None if s is None else s.data_ptr(),
+                None if t is None else t.data_ptr(),
+                None if flow is None else flow[0].data_ptr(),
+                0 if flow is None else flow[1],
+            )
+            rc = self.fused(cfg, x.buf, w, x.h, x.w, C, K, e, stride=stride, check=False)
+            if rc == 0:
+                return o
+            if rc != 1:  # 1 = geometry not supported by the kernel -> plain path from now on
+                raise RuntimeError(f"fused conv {name} failed ({rc})")
+            self._unfusable.add(name)
+        y = self.conv(x, name, stride, out=tmp if out is not None else None)
+        return self.affine(y, name, mode, r=r, out=out, out2=out2, flow=flow)
 
     def in_stats(self, y: S):
         assert y.c0 == 0 and y.c == y.ctot
@@ -332,11 +425,9 @@ class GeneralRAFT:
     # ---- encoders
     def res_block(self, x: S, name, stride, ds, batch):
         if batch:
-            r = self.affine(self.conv(x, name + ".ds", stride), name + ".ds", 0) if ds else x
-            y = self.affine(self.conv(x, name + ".c1", stride), name + ".c1", 1)
-            o = self.conv(y, name + ".c2")
-            del y
-            return self.affine(o, name + ".c2", 3, r=r)
+            r = self.conv_act(x, name + ".ds", 0, stride) if ds else x
+            y = self.conv_act(x, name + ".c1", 1, stride)
+            return self.conv_act(y, name + ".c2", 3, r=r)
         d = st_d = None
         if ds:
             d = self.conv(x, name + ".ds", stride)
@@ -364,7 +455,7 @@ class GeneralRAFT:
         for li, stride in ((1, 1), (2, 2), (3, 2)):
             x = self.res_block(x, f"fnet.layer{li}.0", stride, stride > 1, False)
             x = self.res_block(x, f"fnet.layer{li}.1", 1, False, False)
-        self.affine(self.conv(x, "fnet.conv2", out=out), "fnet.conv2", 0)
+        self.conv_act(x, "fnet.conv2", 0, out=out, tmp=out)
 
     def context_head(self, x: S, lvl, head, L):
         # the level's long-lived buffers are allocated here, after the full-resolution encoder stage is freed
@@ -379,15 +470,15 @@ class GeneralRAFT:
         h_sl = S(L["A"][lvl], 0, 128)
         h0 = S(L["h0"]) if lvl == 0 else None
         if head == "outputs32":
-            self.affine(self.conv(x, f"cnet.{head}.0.conv"), f"cnet.{head}.0.conv", 2, out=h_sl, out2=h0)
-            inp = self.affine(self.conv(x, f"cnet.{head}.1.conv"), f"cnet.{head}.1.conv", 1)
+            self.conv_act(x, f"cnet.{head}.0.conv", 2, out=h_sl, out2=h0)
+            inp = self.conv_act(x, f"cnet.{head}.1.conv", 1)
         else:
             o = self.res_block(x, f"cnet.{head}.0.rb", 1, False, True)
-            self.affine(self.conv(o, f"cnet.{head}.0.conv"), f"cnet.{head}.0.conv", 2, out=h_sl, out2=h0)
+            self.conv_act(o, f"cnet.{head}.0.conv", 2, out=h_sl, out2=h0)
             o = self.res_block(x, f"cnet.{head}.1.rb", 1, False, True)
-            inp = self.affine(self.conv(o, f"cnet.{head}.1.conv"), f"cnet.{head}.1.conv", 1)
+            inp = self.conv_act(o, f"cnet.{head}.1.conv", 1)
             del o
-        z = self.affine(self.conv(inp, f"zqr.{lvl}"), f"zqr.{lvl}", 0)
+        z = self.conv_act(inp, f"zqr.{lvl}", 0)
         g = self.W.gru[lvl]
         k, P = self.k, z.p
         k.launch(
@@ -403,7 +494,7 @@ class GeneralRAFT:
         )
 
     def cnet(self, img: S, L):
-        x = self.affine(self.conv(img, "cnet.conv1"), "cnet.conv1", 1)
+        x = self.conv_act(img, "cnet.conv1", 1)
         for li, stride in ((1, 1), (2, 2), (3, 2)):
             x = self.res_block(x, f"cnet.layer{li}.0", stride, stride > 1, True)
             x = self.res_block(x, f"cnet.layer{li}.1", 1, False, True)
@@ -442,6 +533,71 @@ class GeneralRAFT:
         h, w, wide = A.shape
         P = h * w
         zr, q = L["zr"][lvl], L["q"][lvl]
+        if self.fused is not None:
+            ep = L.setdefault("epi", {}).get(lvl)
+            if ep is None:  # launch arguments are the same every iteration: built once per pass
+                fc, E = self.fused, self._epi
+                h0 = L["h0"].data_ptr() if lvl == 0 else None
+                cfg = fused_cfg_zr(P)
+                zr_call = (
+                    None
+                    if cfg is None
+                    else fc.bind(  # z -> zr[:, :128], r*h -> B[:, :128]
+                        cfg,
+                        A,
+                        g["zr"],
+                        h,
+                        w,
+                        wide,
+                        256,
+                        E(
+                            0,
+                            0,
+                            L["czr"][lvl].data_ptr(),
+                            256,
+                            zr.data_ptr(),
+                            256,
+                            A.data_ptr(),
+                            wide,
+                            B.data_ptr(),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                )
+                q_call = fc.bind(  # h updated in place in A (not read by the q conv), + packed copy h0 at 1/4
+                    fused_cfg_q(P),
+                    B,
+                    g["q"],
+                    h,
+                    w,
+                    wide,
+                    128,
+                    E(
+                        1,
+                        0,
+                        L["cq"][lvl].data_ptr(),
+                        128,
+                        zr.data_ptr(),
+                        256,
+                        A.data_ptr(),
+                        wide,
+                        None,
+                        h0,
+                        None,
+                        None,
+                    ),
+                )
+                ep = L["epi"][lvl] = (zr_call, q_call)
+            zr_call, q_call = ep
+            if zr_call is None:
+                self.convs(S(A), g["zr"], S(zr))
+                k.launch("gru_zr", k.linear(P * 16), zr, L["czr"][lvl], A, B, wide, P)
+            else:
+                zr_call()
+            q_call()
+            return
         self.convs(S(A), g["zr"], S(zr))  # z|r = conv([h | x])
         k.launch(
             "gru_zr", k.linear(P * 16), zr, L["czr"][lvl], A, B, wide, P
@@ -464,8 +620,8 @@ class GeneralRAFT:
         h2, w2, P = L["h2"], L["w2"], L["p2"]
         A0, B0, t64, t128 = L["A"][0], L["B"][0], S(L["t64"]), S(L["t128"])
         k.launch("corr_lookup", k.linear(P), *L["corr"], *L["corr_w"], L["coords"], L["look"], P)
-        self.affine(self.conv(S(L["look"]), "convc1", out=S(L["mc1"])), "convc1", 1)
-        self.affine(self.conv(S(L["mc1"]), "convc2", out=t64), "convc2", 1, out=S(L["mot_in"], 0, 64))
+        self.conv_act(S(L["look"]), "convc1", 1, out=S(L["mc1"]), tmp=S(L["mc1"]))
+        self.conv_act(S(L["mc1"]), "convc2", 1, out=S(L["mot_in"], 0, 64), tmp=t64)
         k.launch(
             "convf1_direct",
             (((w2 + 15) // 16, (h2 + 15) // 16, 1), (16, 16, 1)),
@@ -476,15 +632,32 @@ class GeneralRAFT:
             W.convf1_b,
             L["f1"],
         )
-        self.affine(self.conv(S(L["f1"]), "convf2", out=t64), "convf2", 1, out=S(L["mot_in"], 64, 64))
-        self.affine(self.conv(S(L["mot_in"]), "mconv", out=t128), "mconv", 1, out=S(A0, 128, 128), out2=S(B0, 128, 128))
-        for buf in (A0, B0):
-            k.launch("write_flow", k.linear(P), L["coords"], w2, P, buf.data_ptr() + 2 * (128 + 126), buf.shape[2])
+        self.conv_act(S(L["f1"]), "convf2", 1, out=S(L["mot_in"], 64, 64), tmp=t64)
+        # motion features [relu(conv) (126) | flow_x, 0] into the x-slot of both level-0 GRU buffers
+        self.conv_act(
+            S(L["mot_in"]),
+            "mconv",
+            1,
+            out=S(A0, 128, 128),
+            out2=S(B0, 128, 128),
+            flow=(L["coords"], w2),
+            tmp=t128,
+        )
 
     def flow_head(self, L):
         k, W = self.k, self.W
-        self.affine(self.conv(S(L["h0"]), "fh1", out=S(L["fh"])), "fh1", 1)
-        k.launch("flow_head_out", (((L["p2"] * 32 + 255) // 256, 1, 1), (256, 1, 1)), L["fh"], L["h2"], L["w2"], W.fh2_w, W.fh2_b, L["coords"])
+        self.conv(S(L["h0"]), "fh1", out=S(L["fh"]))  # bias + ReLU fused into the output kernel
+        k.launch(
+            "flow_head_out_br",
+            (((L["p2"] * 32 + 255) // 256, 1, 1), (256, 1, 1)),
+            L["fh"],
+            W.t["fh1"],
+            L["h2"],
+            L["w2"],
+            W.fh2_w,
+            W.fh2_b,
+            L["coords"],
+        )
 
     def iteration(self, L):
         # the motion branch (needs only the disparity) runs on a side stream concurrently with the coarse GRUs
@@ -594,8 +767,8 @@ class GeneralRAFT:
             del L[name]
 
         # mask head + convex upsampling (unpadded output)
-        m1 = self.affine(self.conv(S(L["h0"]), "mask1", out=S(L["fh"])), "mask1", 1)
-        m2 = self.affine(self.conv(m1, "mask2"), "mask2", 0)
+        m1 = self.conv_act(S(L["h0"]), "mask1", 1, out=S(L["fh"]), tmp=S(L["fh"]))
+        m2 = self.conv_act(m1, "mask2", 0)
         out = torch.empty(H, W, device="cuda", dtype=torch.float32)
         k.launch(
             "upsample_out", k.linear(H * W), L["coords"], m2.buf, h2, w2, top, left_, H, W, out, 0

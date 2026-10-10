@@ -529,9 +529,11 @@ extern "C" __global__ void __launch_bounds__(256) corr_gemm(const __half* __rest
 // optionally also to slice o2 (o may equal y: in place):
 //   v = y * s[c] + t[c]   (s == nullptr: scale 1; t == nullptr: shift 0), fp32 math, rounded to fp16
 //   mode 0: v      1: relu(v)      2: tanh(v)      3: relu(fp16(relu(v)) + r)   (residual r: a slice, fp16 add)
+// coords_x != nullptr: channels C-2, C-1 become [coords_x[p] - p % W, 0] (flow input of the GRU, see write_flow).
 extern "C" __global__ void affine_act(const __half* y, int ystride, __half* o, int ostride, __half* o2, int o2stride,
                                       const float* __restrict__ s, const float* __restrict__ t,
-                                      const __half* __restrict__ r, int rstride, long long P, int C, int mode) {
+                                      const __half* __restrict__ r, int rstride, long long P, int C, int mode,
+                                      const float* __restrict__ coords_x, int W) {
     const int CV = C / 8;
     GRID_STRIDE(i, P * CV) {
         long long p = i / CV;
@@ -553,6 +555,10 @@ extern "C" __global__ void affine_act(const __half* y, int ystride, __half* o, i
             __half hv = __float2half(mode == 3 ? fmaxf(v, 0.f) : v);
             if (mode == 3) hv = hrelu(__hadd(hv, rh[k]));
             out[k] = hv;
+        }
+        if (coords_x && c0 + 8 == C) {  // motion features: last two channels = [flow_x, 0] (replaces write_flow)
+            out[6] = __float2half(coords_x[p] - (float)(p % W));
+            out[7] = __float2half(0.f);
         }
         *reinterpret_cast<uint4*>(o + p * ostride + c0) = *reinterpret_cast<const uint4*>(out);
         if (o2) *reinterpret_cast<uint4*>(o2 + p * o2stride + c0) = *reinterpret_cast<const uint4*>(out);
@@ -607,4 +613,32 @@ extern "C" __global__ void gru_update(const __half* __restrict__ q, const __half
         *reinterpret_cast<uint4*>(h + p * stride + c) = *reinterpret_cast<const uint4*>(o);
         if (h2) *reinterpret_cast<uint4*>(h2 + p * 128 + c) = *reinterpret_cast<const uint4*>(o);
     }
+}
+
+// General path: flow_head_out with the hidden layer's bias + ReLU fused (fh = raw conv output, b1: fp32 [256]).
+extern "C" __global__ void flow_head_out_br(const __half* __restrict__ fh, const float* __restrict__ b1, int H, int W,
+                                            const __half* __restrict__ w, const __half* __restrict__ b,
+                                            float* __restrict__ coords_x) {
+    int lane = threadIdx.x & 31;
+    long long p = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (p >= (long long)H * W) return;
+    int y = (int)(p / W), x = (int)(p % W);
+    float bb[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) bb[k] = b1[lane * 8 + k];
+    float acc = 0.f;
+#pragma unroll
+    for (int t = 0; t < 9; ++t) {
+        int ny = y + t / 3 - 1, nx = x + t % 3 - 1;
+        if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue;
+        uint4 fv = *reinterpret_cast<const uint4*>(fh + ((long long)ny * W + nx) * 256 + lane * 8);
+        uint4 wv = *reinterpret_cast<const uint4*>(w + t * 256 + lane * 8);
+        const __half *f8 = reinterpret_cast<const __half*>(&fv), *w8 = reinterpret_cast<const __half*>(&wv);
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+            acc += __half2float(__float2half(fmaxf(__half2float(f8[k]) + bb[k], 0.f))) * __half2float(w8[k]);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) coords_x[p] += __half2float(__float2half(acc + __half2float(b[0])));
 }

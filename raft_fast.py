@@ -22,6 +22,8 @@ import time
 _T0 = time.perf_counter()
 # fewer reserved-but-unused bytes when consecutive images have different sizes (set before torch initializes CUDA)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# v8: fused-epilogue convs (GRU + K>=128 conv/BN/act) from the shipped CUTLASS library; RAFT_FUSED=0 gives v7
+os.environ.setdefault("RAFT_FUSED", "1")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CKPT = os.path.join(_HERE, "models", "raftstereo-middlebury.pth")
 
