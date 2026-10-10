@@ -100,7 +100,12 @@ class RAFTStereo(nn.Module):
                 fmap1, fmap2 = self.conv2(x).split(dim=0, split_size=x.shape[0]//2)
             else:
                 cnet_list = self.cnet(image1, num_layers=self.args.n_gru_layers)
-                fmap1, fmap2 = self.fnet([image1, image2])
+                if getattr(self.args, 'fnet_sequential', False):
+                    # one image at a time: halves the encoder's full-res activation peak; InstanceNorm is
+                    # per sample, so the result is the same as the batched call
+                    fmap1, fmap2 = self.fnet(image1), self.fnet(image2)
+                else:
+                    fmap1, fmap2 = self.fnet([image1, image2])
             net_list = [torch.tanh(x[0]) for x in cnet_list]
             inp_list = [torch.relu(x[1]) for x in cnet_list]
 
