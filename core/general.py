@@ -48,8 +48,8 @@ def _normconv():
     try:
         from fastbb import normconv
     except ImportError:
-        import sys
-        sys.path.insert(0, "/home/florian/projects/experiments/006-fast-backbones")
+        import os, sys
+        sys.path.insert(0, os.environ.get("FASTBB_PATH", os.devnull))  # pip install fastbb (fastforks/fastbb) or set FASTBB_PATH to a checkout
         from fastbb import normconv
     normconv.load()
     return normconv
