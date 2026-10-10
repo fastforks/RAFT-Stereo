@@ -26,6 +26,9 @@ class RAFTStereo(nn.Module):
         # channels_last keeps every activation NHWC, which cuDNN's tensor-core kernels use natively
         # (NCHW inputs make cuDNN wrap convolutions in nchwToNhwc/nhwcToNchw transposes)
         self.memory_format = torch.channels_last if getattr(args, 'channels_last', False) else torch.contiguous_format
+        # channels_last_loop: NHWC only in the update loop; the encoders stay NCHW (InstanceNorm on NHWC is slow:
+        # it is computed as batch_norm on a reshaped tensor, which copies)
+        self.loop_memory_format = torch.channels_last if getattr(args, 'channels_last_loop', False) else self.memory_format
 
         context_dims = args.hidden_dims
 
@@ -98,6 +101,9 @@ class RAFTStereo(nn.Module):
 
             # Rather than running the GRU's conv layers on the context features multiple times, we do it once at the beginning 
             inp_list = [list(conv(i).split(split_size=conv.out_channels//3, dim=1)) for i,conv in zip(inp_list, self.context_zqr_convs)]
+            if self.loop_memory_format != self.memory_format:
+                net_list = [x.contiguous(memory_format=self.loop_memory_format) for x in net_list]
+                inp_list = [[x.contiguous(memory_format=self.loop_memory_format) for x in l] for l in inp_list]
 
         if self.args.corr_implementation == "reg": # Default
             corr_block = CorrBlock1D
@@ -119,8 +125,8 @@ class RAFTStereo(nn.Module):
         flow_predictions = []
         for itr in range(iters):
             coords1 = coords1.detach()
-            corr = corr_fn(coords1).contiguous(memory_format=self.memory_format) # index correlation volume
-            flow = (coords1 - coords0).contiguous(memory_format=self.memory_format)  # NCHW flow would turn every cat it joins NCHW
+            corr = corr_fn(coords1).contiguous(memory_format=self.loop_memory_format) # index correlation volume
+            flow = (coords1 - coords0).contiguous(memory_format=self.loop_memory_format)  # NCHW flow would turn every cat it joins NCHW
             with autocast(enabled=self.args.mixed_precision):
                 if self.args.n_gru_layers == 3 and self.args.slow_fast_gru: # Update low-res GRU
                     net_list = self.update_block(net_list, inp_list, iter32=True, iter16=False, iter08=False, update=False)
