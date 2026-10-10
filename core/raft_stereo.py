@@ -23,7 +23,10 @@ class RAFTStereo(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        
+        # channels_last keeps every activation NHWC, which cuDNN's tensor-core kernels use natively
+        # (NCHW inputs make cuDNN wrap convolutions in nchwToNhwc/nhwcToNchw transposes)
+        self.memory_format = torch.channels_last if getattr(args, 'channels_last', False) else torch.contiguous_format
+
         context_dims = args.hidden_dims
 
         self.cnet = MultiBasicEncoder(output_dim=[args.hidden_dims, context_dims], norm_fn=args.context_norm, downsample=args.n_downsample)
@@ -37,6 +40,15 @@ class RAFTStereo(nn.Module):
                 nn.Conv2d(128, 256, 3, padding=1))
         else:
             self.fnet = BasicEncoder(output_dim=256, norm_fn='instance', downsample=args.n_downsample)
+
+    def half_conv_weights(self):
+        """Inference with mixed precision: store conv weights in fp16 once. Autocast would cast them
+        fp32 -> fp16 again in every iteration (its cast cache is cleared whenever the autocast region
+        is left); the rounding is the same, so the output is unchanged. """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                m.half()
+        return self
 
     def freeze_bn(self):
         for m in self.modules():
@@ -56,7 +68,7 @@ class RAFTStereo(nn.Module):
         """ Upsample flow field [H/8, W/8, 2] -> [H, W, 2] using convex combination """
         N, D, H, W = flow.shape
         factor = 2 ** self.args.n_downsample
-        mask = mask.view(N, 1, 9, factor, factor, H, W)
+        mask = mask.reshape(N, 1, 9, factor, factor, H, W)
         mask = torch.softmax(mask, dim=2)
 
         up_flow = F.unfold(factor * flow, [3,3], padding=1)
@@ -70,8 +82,8 @@ class RAFTStereo(nn.Module):
     def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
         """ Estimate optical flow between pair of frames """
 
-        image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
-        image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
+        image1 = (2 * (image1 / 255.0) - 1.0).contiguous(memory_format=self.memory_format)
+        image2 = (2 * (image2 / 255.0) - 1.0).contiguous(memory_format=self.memory_format)
 
         # run the context network
         with autocast(enabled=self.args.mixed_precision):
@@ -107,8 +119,8 @@ class RAFTStereo(nn.Module):
         flow_predictions = []
         for itr in range(iters):
             coords1 = coords1.detach()
-            corr = corr_fn(coords1) # index correlation volume
-            flow = coords1 - coords0
+            corr = corr_fn(coords1).contiguous(memory_format=self.memory_format) # index correlation volume
+            flow = (coords1 - coords0).contiguous(memory_format=self.memory_format)  # NCHW flow would turn every cat it joins NCHW
             with autocast(enabled=self.args.mixed_precision):
                 if self.args.n_gru_layers == 3 and self.args.slow_fast_gru: # Update low-res GRU
                     net_list = self.update_block(net_list, inp_list, iter32=True, iter16=False, iter08=False, update=False)
