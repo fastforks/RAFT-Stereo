@@ -62,8 +62,10 @@ class RAFTStereo(nn.Module):
         """ Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, _, H, W = img.shape
 
-        coords0 = coords_grid(N, H, W, device=img.device)
-        coords1 = coords_grid(N, H, W, device=img.device)
+        # disparity state; fp16 only to study precision (fp16 spacing is 0.25 for values 256-512, i.e. 1 px at full res)
+        dtype = getattr(torch, getattr(self.args, 'coords_dtype', 'float32'))
+        coords0 = coords_grid(N, H, W, device=img.device).to(dtype)
+        coords1 = coords_grid(N, H, W, device=img.device).to(dtype)
 
         return coords0, coords1
 
@@ -85,8 +87,11 @@ class RAFTStereo(nn.Module):
     def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
         """ Estimate optical flow between pair of frames """
 
-        image1 = (2 * (image1 / 255.0) - 1.0).contiguous(memory_format=self.memory_format)
-        image2 = (2 * (image2 / 255.0) - 1.0).contiguous(memory_format=self.memory_format)
+        # feed the network in its weight dtype: a no-op for fp32 weights, the same rounding autocast applies for
+        # fp16 weights, and required when the whole model is fp16 (model.half(), no autocast)
+        w_dtype = self.update_block.encoder.convf1.weight.dtype
+        image1 = (2 * (image1 / 255.0) - 1.0).to(w_dtype).contiguous(memory_format=self.memory_format)
+        image2 = (2 * (image2 / 255.0) - 1.0).to(w_dtype).contiguous(memory_format=self.memory_format)
 
         # run the context network
         with autocast(enabled=self.args.mixed_precision):
@@ -126,7 +131,7 @@ class RAFTStereo(nn.Module):
         for itr in range(iters):
             coords1 = coords1.detach()
             corr = corr_fn(coords1).contiguous(memory_format=self.loop_memory_format) # index correlation volume
-            flow = (coords1 - coords0).contiguous(memory_format=self.loop_memory_format)  # NCHW flow would turn every cat it joins NCHW
+            flow = (coords1 - coords0).to(w_dtype).contiguous(memory_format=self.loop_memory_format)  # NCHW flow would turn every cat it joins NCHW
             with autocast(enabled=self.args.mixed_precision):
                 if self.args.n_gru_layers == 3 and self.args.slow_fast_gru: # Update low-res GRU
                     net_list = self.update_block(net_list, inp_list, iter32=True, iter16=False, iter08=False, update=False)
