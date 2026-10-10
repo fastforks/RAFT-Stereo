@@ -45,13 +45,20 @@ FASTBB_ENC = os.environ.get("FASTBB_ENC", "1") == "1"
 
 
 def _normconv():
+    """fastbb.normconv (CUTLASS torch-op library, built on first use: needs CUTLASS_DIR + nvcc, see fastforks/fastbb). None when
+    fastbb or the library is unavailable: the previous (cuDNN + separate norm kernels) encoder path is used."""
     try:
-        from fastbb import normconv
-    except ImportError:
-        import os, sys
-        sys.path.insert(0, os.environ.get("FASTBB_PATH", os.devnull))  # pip install fastbb (fastforks/fastbb) or set FASTBB_PATH to a checkout
-        from fastbb import normconv
-    normconv.load()
+        try:
+            from fastbb import normconv
+        except ImportError:
+            import os, sys
+            sys.path.insert(0, os.environ.get("FASTBB_PATH", os.devnull))  # pip install fastbb or set FASTBB_PATH to a checkout
+            from fastbb import normconv
+        normconv.load()
+    except (ImportError, RuntimeError) as e:
+        import warnings
+        warnings.warn(f"fastbb.normconv unavailable ({e}); using the previous encoder path (FASTBB_ENC=0)")
+        return None
     return normconv
 
 
