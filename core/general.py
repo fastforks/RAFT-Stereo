@@ -35,29 +35,30 @@ except ImportError as e:  # pragma: no cover
 
 CX = (256, 256, 128)  # x-part channels of the GRU inputs at 1/4, 1/8, 1/16
 IN_CHUNK = 1024
-VERIFY = os.environ.get("RAFT_VERIFY") == "1"   # check every new conv plan against an fp32 reference (debug)
-FUSED = os.environ.get("RAFT_FUSED", "0") == "1"  # GRU convs with fused epilogues (core/cutlass_conv.cu, compiled once)
-# encoders via fastbb.normconv (exp 006 fastbb; fastbb-encoder workstream, 2026-10-10): cnet < 128-channel convs as one
-# CUTLASS kernel with the BN + ReLU / ResidualBlock-tail epilogue (before: cuDNN + affine pass); fnet (instance norm): the
-# instance-norm statistics computed in the conv epilogue (no stats pass) and, for the 64-channel stride-1 convs, the
-# normalize + ReLU of the previous conv applied in the conv mainloop (no apply pass). FASTBB_ENC=0: previous path.
+VERIFY = (
+    os.environ.get("RAFT_VERIFY") == "1"
+)  # check every new conv plan against an fp32 reference (debug)
+FUSED = (
+    os.environ.get("RAFT_FUSED", "0") == "1"
+)  # GRU convs with fused epilogues (core/cutlass_conv.cu, compiled once)
+# Optional CUTLASS encoder convolutions. The context encoder folds BN/ReLU into the epilogue.
 FASTBB_ENC = os.environ.get("FASTBB_ENC", "1") == "1"
 
 
 def _normconv():
-    """fastbb.normconv (CUTLASS torch-op library, built on first use: needs CUTLASS_DIR + nvcc, see fastforks/fastbb). None when
-    fastbb or the library is unavailable: the previous (cuDNN + separate norm kernels) encoder path is used."""
+    """fastbb_vendored.normconv (vendored from fastforks/fastbb; CUTLASS torch-op library, built on first use: needs CUTLASS_DIR +
+    nvcc). None when the library is unavailable: the previous (cuDNN + separate norm kernels) encoder path is used."""
     try:
-        try:
-            from fastbb import normconv
-        except ImportError:
-            import os, sys
-            sys.path.insert(0, os.environ.get("FASTBB_PATH", os.devnull))  # pip install fastbb or set FASTBB_PATH to a checkout
-            from fastbb import normconv
+        from fastbb_vendored import normconv
+
         normconv.load()
     except (ImportError, RuntimeError) as e:
         import warnings
-        warnings.warn(f"fastbb.normconv unavailable ({e}); using the previous encoder path (FASTBB_ENC=0)")
+
+        warnings.warn(
+            f"fastbb_vendored.normconv unavailable ({e}); using the previous encoder path (FASTBB_ENC=0)",
+            stacklevel=2,
+        )
         return None
     return normconv
 
@@ -488,23 +489,6 @@ class GeneralRAFT:
         )
 
     # ---- encoders
-    def res_block_nc(self, x: S, name, stride, ds):
-        """instance-norm ResidualBlock with fastbb.normconv: stats from the conv epilogues; the conv1 output is normalized
-        (+ ReLU) inside conv2's mainloop when conv2 is 64-channel (cheaper than a pass there; a pass for 96 / 128)."""
-        nc, W4 = self.nc, self.W4
-        x4 = _t4(x)
-        d4 = sd = None
-        if ds:
-            d4, sd = nc.conv_in(x4, W4[name + ".ds"], stride=stride)
-        c1, s1 = nc.conv_in(x4, W4[name + ".c1"], stride=stride)
-        if FASTBB_ENC_PRE and W4[name + ".c2"].shape[0] <= 64:
-            c2, s2 = nc.conv_in(c1, W4[name + ".c2"], pre=s1)
-        else:
-            c2, s2 = nc.conv_in(nc.in_apply(c1, s1, mode=0, inplace=True), W4[name + ".c2"])
-        del c1
-        o = nc.in_apply(c2, s2, mode=2, r=d4, rst=sd, inplace=True) if ds else nc.in_apply(c2, s2, mode=1, r=x4, inplace=True)
-        return S(o.permute(0, 2, 3, 1)[0])
-
     def res_block(self, x: S, name, stride, ds, batch):
         if batch:
             r = self.conv_act(x, name + ".ds", 0, stride) if ds else x
