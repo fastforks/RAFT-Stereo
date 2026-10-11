@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from core.update import BasicMultiUpdateBlock
 from core.extractor import BasicEncoder, MultiBasicEncoder, ResidualBlock
-from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D, AlternateCorrBlock, CorrBlockGather1D
+from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D, CorrBlockGather1D
 from core.utils.utils import coords_grid, upflow8
 
 
@@ -159,12 +159,12 @@ class RAFTStereo(nn.Module):
         elif self.args.corr_implementation == "alt": # More memory efficient than reg
             corr_block = PytorchAlternateCorrBlock1D
             fmap1, fmap2 = fmap1.float(), fmap2.float()
-        elif self.args.corr_implementation == "reg_cuda": # Faster version of reg
+        elif self.args.corr_implementation == "reg_cuda":
             corr_block = CorrBlockFast1D
-        elif self.args.corr_implementation == "alt_cuda": # Faster version of alt
-            corr_block = AlternateCorrBlock
         elif self.args.corr_implementation == "reg_gather": # reg_cuda's lookup in plain PyTorch (exportable, no extension)
             corr_block = CorrBlockGather1D
+        else:
+            raise ValueError("supported correlation implementations: reg, alt, reg_cuda and reg_gather")
         corr_fn = corr_block(fmap1, fmap2, radius=self.args.corr_radius, num_levels=self.args.corr_levels)
 
         coords0, coords1 = self.initialize_flow(net_list[0])
