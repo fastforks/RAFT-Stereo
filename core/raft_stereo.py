@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from core.update import BasicMultiUpdateBlock
 from core.extractor import BasicEncoder, MultiBasicEncoder, ResidualBlock
-from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D, AlternateCorrBlock
+from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D, CorrBlockGather1D
 from core.utils.utils import coords_grid, upflow8
 
 
@@ -44,10 +44,45 @@ class RAFTStereo(nn.Module):
         else:
             self.fnet = BasicEncoder(output_dim=256, norm_fn='instance', downsample=args.n_downsample)
 
+    @torch.no_grad()
+    def fold_batchnorm(self):
+        """Inference: eval BatchNorm layers that directly follow a conv folded into that conv (in fp32; exact up to
+        rounding). Removes the BN passes and keeps exported fp16 graphs single-typed (graph optimizers that fold an
+        fp32 BN into an fp16 conv produce mixed-type convs TensorRT rejects)."""
+
+        def fold(conv, bn):
+            s = bn.weight.float() * torch.rsqrt(bn.running_var.float() + bn.eps)
+            b = conv.bias.float() if conv.bias is not None else torch.zeros_like(s)
+            conv.weight.data = (conv.weight.float() * s.view(-1, 1, 1, 1)).to(conv.weight.dtype)
+            conv.bias = nn.Parameter(
+                ((b - bn.running_mean.float()) * s + bn.bias.float()).to(conv.weight.dtype)
+            )
+
+        for m in self.modules():
+            for c, n in (("conv1", "norm1"), ("conv2", "norm2"), ("conv3", "norm3")):
+                if isinstance(getattr(m, c, None), nn.Conv2d) and isinstance(
+                    getattr(m, n, None), nn.BatchNorm2d
+                ):
+                    fold(getattr(m, c), getattr(m, n))
+                    setattr(m, n, nn.Identity())
+            ds = getattr(m, "downsample", None)
+            if (
+                isinstance(ds, nn.Sequential)
+                and len(ds) == 2
+                and isinstance(ds[0], nn.Conv2d)
+                and isinstance(ds[1], nn.BatchNorm2d)
+            ):
+                fold(ds[0], ds[1])
+                ds[1] = nn.Identity()
+                if isinstance(getattr(m, "norm3", None), nn.BatchNorm2d):
+                    m.norm3 = nn.Identity()
+        return self
+
     def half_conv_weights(self):
         """Inference with mixed precision: store conv weights in fp16 once. Autocast would cast them
         fp32 -> fp16 again in every iteration (its cast cache is cleared whenever the autocast region
-        is left); the rounding is the same, so the output is unchanged. """
+        is left); the rounding is the same, so the output is unchanged. BatchNorm is folded into the convs first."""
+        self.fold_batchnorm()
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 m.half()
@@ -124,10 +159,12 @@ class RAFTStereo(nn.Module):
         elif self.args.corr_implementation == "alt": # More memory efficient than reg
             corr_block = PytorchAlternateCorrBlock1D
             fmap1, fmap2 = fmap1.float(), fmap2.float()
-        elif self.args.corr_implementation == "reg_cuda": # Faster version of reg
+        elif self.args.corr_implementation == "reg_cuda":
             corr_block = CorrBlockFast1D
-        elif self.args.corr_implementation == "alt_cuda": # Faster version of alt
-            corr_block = AlternateCorrBlock
+        elif self.args.corr_implementation == "reg_gather": # reg_cuda's lookup in plain PyTorch (exportable, no extension)
+            corr_block = CorrBlockGather1D
+        else:
+            raise ValueError("supported correlation implementations: reg, alt, reg_cuda and reg_gather")
         corr_fn = corr_block(fmap1, fmap2, radius=self.args.corr_radius, num_levels=self.args.corr_levels)
 
         coords0, coords1 = self.initialize_flow(net_list[0])
