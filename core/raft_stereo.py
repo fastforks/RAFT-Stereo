@@ -47,8 +47,8 @@ class RAFTStereo(nn.Module):
         """ Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, _, H, W = img.shape
 
-        coords0 = coords_grid(N, H, W).to(img.device)
-        coords1 = coords_grid(N, H, W).to(img.device)
+        coords0 = coords_grid(N, H, W, device=img.device)
+        coords1 = coords_grid(N, H, W, device=img.device)
 
         return coords0, coords1
 
@@ -59,7 +59,10 @@ class RAFTStereo(nn.Module):
         mask = mask.view(N, 1, 9, factor, factor, H, W)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(factor * flow, [3,3], padding=1)
+        # 3x3 neighbourhoods as 9 shifted slices of the zero-padded flow (= F.unfold(.., [3,3], padding=1), same
+        # order; unfold/Im2Col has no ONNX / TensorRT counterpart)
+        fp = F.pad(factor * flow, [1, 1, 1, 1])
+        up_flow = torch.stack([fp[:, :, i:i + H, j:j + W] for i in range(3) for j in range(3)], dim=2)
         up_flow = up_flow.view(N, D, 9, 1, 1, H, W)
 
         up_flow = torch.sum(mask * up_flow, dim=2)
@@ -114,7 +117,9 @@ class RAFTStereo(nn.Module):
                     net_list = self.update_block(net_list, inp_list, iter32=True, iter16=False, iter08=False, update=False)
                 if self.args.n_gru_layers >= 2 and self.args.slow_fast_gru:# Update low-res GRU and mid-res GRU
                     net_list = self.update_block(net_list, inp_list, iter32=self.args.n_gru_layers==3, iter16=True, iter08=False, update=False)
-                net_list, up_mask, delta_flow = self.update_block(net_list, inp_list, corr, flow, iter32=self.args.n_gru_layers==3, iter16=self.args.n_gru_layers>=2)
+                # in test_mode only the last iteration's upsampling mask is used
+                compute_mask = not test_mode or itr == iters-1
+                net_list, up_mask, delta_flow = self.update_block(net_list, inp_list, corr, flow, iter32=self.args.n_gru_layers==3, iter16=self.args.n_gru_layers>=2, compute_mask=compute_mask)
 
             # in stereo mode, project flow onto epipolar
             delta_flow[:,1] = 0.0

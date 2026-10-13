@@ -44,7 +44,7 @@ class CorrBlockFast1D:
     def __call__(self, coords):
         out_pyramid = []
         bz, _, ht, wd = coords.shape
-        coords = coords[:, [0]]
+        coords = coords[:, :1]  # list indexing ([0]) builds a CPU index tensor -> H2D copy + sync
         for i in range(self.num_levels):
             corr = CorrSampler.apply(self.corr_pyramid[i].squeeze(3), coords/2**i, self.radius)
             out_pyramid.append(corr.view(bz, -1, ht, wd))
@@ -118,6 +118,8 @@ class CorrBlock1D:
 
         batch, h1, w1, _, w2 = corr.shape
         corr = corr.reshape(batch*h1*w1, 1, 1, w2)
+        # lookup offsets, created on the device once (a CPU tensor .to(device) per call syncs the stream)
+        self.dx = torch.linspace(-radius, radius, 2*radius+1, device=corr.device).view(2*radius+1, 1)
 
         self.corr_pyramid.append(corr)
         for i in range(self.num_levels):
@@ -132,9 +134,7 @@ class CorrBlock1D:
         out_pyramid = []
         for i in range(self.num_levels):
             corr = self.corr_pyramid[i]
-            dx = torch.linspace(-r, r, 2*r+1)
-            dx = dx.view(2*r+1, 1).to(coords.device)
-            x0 = dx + coords.reshape(batch*h1*w1, 1, 1, 1) / 2**i
+            x0 = self.dx + coords.reshape(batch*h1*w1, 1, 1, 1) / 2**i
             y0 = torch.zeros_like(x0)
 
             coords_lvl = torch.cat([x0,y0], dim=-1)
