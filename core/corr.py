@@ -46,7 +46,7 @@ class CorrBlockFast1D:
         bz, _, ht, wd = coords.shape
         coords = coords[:, :1]  # list indexing ([0]) builds a CPU index tensor -> H2D copy + sync
         for i in range(self.num_levels):
-            corr = CorrSampler.apply(self.corr_pyramid[i].squeeze(3), coords/2**i, self.radius)
+            corr = CorrSampler.apply(self.corr_pyramid[i].squeeze(3), (coords/2**i).float(), self.radius)  # sampler reads fp32 coords
             out_pyramid.append(corr.view(bz, -1, ht, wd))
         return torch.cat(out_pyramid, dim=1)
 
@@ -104,7 +104,7 @@ class PytorchAlternateCorrBlock1D:
             fmap2 = F.avg_pool2d(fmap2, [1, 2], stride=[1, 2])
             out_pyramid.append(corr)
         out = torch.cat(out_pyramid, dim=-1)
-        return out.permute(0, 3, 1, 2).contiguous().float()
+        return out.permute(0, 3, 1, 2).float()  # caller picks the memory format
 
 
 class CorrBlock1D:
@@ -143,7 +143,7 @@ class CorrBlock1D:
             out_pyramid.append(corr)
 
         out = torch.cat(out_pyramid, dim=-1)
-        return out.permute(0, 3, 1, 2).contiguous().float()
+        return out.permute(0, 3, 1, 2).float()  # caller picks the memory format
 
     @staticmethod
     def corr(fmap1, fmap2):
